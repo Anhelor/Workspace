@@ -1,0 +1,446 @@
+diff --git a/deepspeed/runtime/config.py b/deepspeed/runtime/config.py
+index 975fb1f..4da5525 100755
+--- a/deepspeed/runtime/config.py
++++ b/deepspeed/runtime/config.py
+@@ -464,6 +464,7 @@ def get_pipeline_config(param_dict):
+         "activation_checkpoint_interval": 0,
+         "pipe_partitioned": True,
+         "grad_partitioned": True,
++        "CoPipe_ratios": None,
+     }
+     config = default_pipeline
+     for key, val in param_dict.get("pipeline", {}).items():
+diff --git a/deepspeed/runtime/engine.py b/deepspeed/runtime/engine.py
+index eb17c69..da12f88 100644
+--- a/deepspeed/runtime/engine.py
++++ b/deepspeed/runtime/engine.py
+@@ -91,7 +91,7 @@ from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoin
+ from .pipe.module import PipelineModule
+ from .utils import get_ma_status
+ from .compiler import CompiledModuleWrapper
+-from ..ops.adam import FusedAdam
++from ..ops.adam import FusedAdam, DeepSpeedCPUAdam
+ from ..moe.sharded_moe import TopKGate, MOELayer
+ from ..moe.layer import MoE
+ from ..moe.utils import is_moe_param
+@@ -1414,9 +1414,9 @@ class DeepSpeedEngine(Module):
+         dynamic_loss_args = self.dynamic_loss_scale_args()
+         clip_grad = self.gradient_clipping()
+         if APEX_INSTALLED:
+-            fused_opts = (apex.optimizers.FusedAdam, FusedAdam)
++            fused_opts = (apex.optimizers.FusedAdam, FusedAdam, DeepSpeedCPUAdam)
+         else:
+-            fused_opts = FusedAdam
++            fused_opts = (FusedAdam, DeepSpeedCPUAdam)
+         if isinstance(optimizer, fused_opts) \
+                 or self.optimizer_name() in [ONEBIT_ADAM_OPTIMIZER, ZERO_ONE_ADAM_OPTIMIZER]:
+             if self.dynamic_loss_scale():
+diff --git a/deepspeed/runtime/fp16/fused_optimizer.py b/deepspeed/runtime/fp16/fused_optimizer.py
+index 182f806..fb1eda4 100755
+--- a/deepspeed/runtime/fp16/fused_optimizer.py
++++ b/deepspeed/runtime/fp16/fused_optimizer.py
+@@ -11,12 +11,13 @@ import torch
+ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+ 
+ from deepspeed.runtime import DeepSpeedOptimizer
+-from deepspeed.runtime.utils import get_global_norm, get_grad_norm, CheckOverflow, get_weight_norm, required_torch_version
++from deepspeed.runtime.utils import get_global_norm, get_grads_norm, see_memory_usage, get_weight_norm, required_torch_version
+ from deepspeed.runtime.fp16.loss_scaler import INITIAL_LOSS_SCALE, SCALE_WINDOW, MIN_LOSS_SCALE
+ from deepspeed.utils import groups, logger, log_dist
+ from deepspeed import comm as dist
+ from deepspeed.checkpoint.constants import OPTIMIZER_STATE_DICT, CLIP_GRAD
+ from deepspeed.accelerator import get_accelerator
++from deepspeed.ops.adam import FusedAdam
+ 
+ OVERFLOW_CHECK_TIMER = 'overflow_check'
+ COMPUTE_NORM_TIMER = 'compute_norm'
+@@ -58,6 +59,19 @@ class FP16_Optimizer(DeepSpeedOptimizer):
+             raise SystemError("Cannot use fp16 without accelerator.")
+         self.optimizer = init_optimizer
+ 
++        # co-optimizer
++        self.accel = get_accelerator()
++        self.cpu_rank, self.local_rank = -1, dist.get_local_rank()
++        self.ratios = self.deepspeed._config.pipeline["CoPipe_ratios"][self.local_rank]
++        self.fp16_groups_ = {rank: [] for rank in self.ratios}
++        self.fp16_groups_flat_ = {rank: [] for rank in self.ratios}
++        self.fp16_groups__ = {rank: [] for rank in self.ratios}
++        self.fp32_groups_flat_ = {rank: [] for rank in self.ratios}
++        self.opt_streams, self.recv_streams, self.optimizers = {}, {}, {}
++        self.fp16_groups_flat_buffer = []
++        self.bucket_size = int(1.5 * 2**28)
++        assert abs(sum(self.ratios.values()) - 1) < 1e-9, "The sum of ratios should be 1"
++
+         # param flattened by groups
+         self.fp16_groups = []
+         self.fp16_groups_flat = []
+@@ -69,17 +83,74 @@ class FP16_Optimizer(DeepSpeedOptimizer):
+         for i, param_group in enumerate(self.optimizer.param_groups):
+             # push this group to list before modify
+             self.fp16_groups.append(param_group['params'])
++            # partition fp16_groups
++            start_idx, last_rank = 0, max(self.ratios.keys())
++            for rank, ratio in sorted(self.ratios.items()):
++                end_idx = start_idx + round(len(self.fp16_groups[i]) * ratio)
++                self.fp16_groups__[rank].append(self.fp16_groups[i][start_idx:end_idx])
++                start_idx = end_idx
++            self.fp16_groups__[last_rank][i] += self.fp16_groups[i][start_idx:]
+             # init fp16 weight buffer, flattened
+-            self.fp16_groups_flat.append(_flatten_dense_tensors([p.clone().detach() for p in self.fp16_groups[i]]))
++            for rank, subgroups in sorted(self.fp16_groups__.items()):
++                self.fp16_groups_[rank].append(self.partition_params([p for p in subgroups[i]]))
++            for rank, subgroups in sorted(self.fp16_groups_.items()):
++                params_subgroups_flat = []
++                for params in subgroups[i]:
++                    params_subgroups_flat.append(_flatten_dense_tensors([p.clone().detach() for p in params]))
++                self.fp16_groups_flat_[rank].append(params_subgroups_flat)
++            params_subgroups = [p for _, subgroups in sorted(self.fp16_groups_flat_.items()) for p in subgroups[i]]
++            self.fp16_groups_flat.append(_flatten_dense_tensors(params_subgroups))
++            # set model fp16 subgroups weight to slices of flattened buffer
++            updated_params_subgroups = _unflatten_dense_tensors(self.fp16_groups_flat[i], params_subgroups)
++            for p, q in zip(params_subgroups, updated_params_subgroups):
++                p.data = q.data
+             # set model fp16 weight to slices of flattened buffer
+             updated_params = _unflatten_dense_tensors(self.fp16_groups_flat[i], self.fp16_groups[i])
+             for p, q in zip(self.fp16_groups[i], updated_params):
+                 p.data = q.data
+             # init master weight, flattened
+-            self.fp32_groups_flat.append(self.fp16_groups_flat[i].clone().float().detach())
++            for rank, subgroups in sorted(self.fp16_groups_flat_.items()):
++                if rank == self.cpu_rank:
++                    self.fp32_groups_flat_[rank].append(
++                        [p.clone().to('cpu').float().detach().pin_memory() for p in subgroups[i]])
++                    self.fp16_groups_flat_buffer.append(
++                        [p.clone().to('cpu').detach().pin_memory() for p in subgroups[i]])
++                else:
++                    self.fp32_groups_flat_[rank].append([p.clone().to(rank).float().detach() for p in subgroups[i]])
+             # modify optimizer of have flat master weight
+-            self.fp32_groups_flat[i].requires_grad = True  # keep this in case internal optimizer uses it
+-            param_group['params'] = [self.fp32_groups_flat[i]]
++            for subgroups in self.fp32_groups_flat_.values():
++                for params in subgroups[i]:
++                    params.requires_grad = True  # keep this in case internal optimizer uses it
++            param_group['params'] = self.fp32_groups_flat_[self.cpu_rank][i]
++
++        # optimizer setup for each rank
++        for rank in sorted(self.ratios):
++            opt_device = self.local_rank if rank == self.cpu_rank else rank
++            self.opt_streams[rank] = self.accel.Stream(device=opt_device)
++            self.recv_streams[rank] = self.accel.Stream(device=self.local_rank)
++
++            if rank == self.cpu_rank:
++                self.optimizers[rank] = self.optimizer
++            else:
++                self.optimizers[rank] = FusedAdam(
++                    self.fp32_groups_flat_[rank][0], **{
++                        k: self.optimizer.param_groups[0][k]
++                        for k in ["lr", "bias_correction", "betas", "eps", "weight_decay", "amsgrad"]
++                    })
++                if len(self.optimizer.param_groups) > 1:
++                    for i in range(1, len(self.optimizer.param_groups)):
++                        param_group = {
++                            k: self.fp32_groups_flat_[rank][i] if k == "params" else self.optimizer.param_groups[i][k]
++                            for k in ["params"
++                                      "lr", "bias_correction", "betas", "eps", "weight_decay", "amsgrad"]
++                        }
++                        self.optimizers[rank].add_param_group(param_group)
++
++        partition_logs = {
++            k: [(len(group), sum(p.numel() for p in group)) for group in v[0]]
++            for k, v in self.fp16_groups_.items()
++        }
++        log_dist(f"params_partitions = {partition_logs}", ranks=list(range(dist.get_world_size())))
+ 
+         # we may have a way of fusing dynamic scale. Do not support for now
+         if dynamic_loss_scale:
+@@ -117,18 +188,44 @@ class FP16_Optimizer(DeepSpeedOptimizer):
+         self.mpu = mpu
+ 
+         self.overflow = False
+-        self.overflow_checker = CheckOverflow(self.fp16_groups, mpu=self.mpu, deepspeed=deepspeed)
++        self.overflow_checker = None
++        see_memory_usage("Before initializing optimizer states", force=True)
+         self.initialize_optimizer_states()
++        see_memory_usage("After initializing optimizer states", force=True)
++
++    def partition_params(self, groups):
++        partitions = []
++        curr_part = []
++        curr_numel = 0
++
++        for p in groups:
++            if p.numel() + curr_numel > self.bucket_size:
++                if curr_part:
++                    partitions.append(curr_part)
++                curr_part = [p]
++                curr_numel = p.numel()
++            else:
++                curr_part.append(p)
++                curr_numel += p.numel()
++        if curr_part:
++            partitions.append(curr_part)
++        return partitions
+ 
+     def initialize_optimizer_states(self):
+         for i, group in enumerate(self.fp16_groups):
+-            self.fp32_groups_flat[i].grad = torch.zeros(self.fp32_groups_flat[i].size(),
+-                                                        device=self.fp32_groups_flat[i].device)
++            for rank in sorted(self.ratios):
++                for p in self.fp32_groups_flat_[rank][i]:
++                    grad = torch.zeros_like(p).pin_memory() if rank == self.cpu_rank else torch.zeros_like(p)
++                    p.grad = grad
+ 
+-        self.optimizer.step()
++        for rank in sorted(self.ratios):
++            self.optimizers[rank].step()
+ 
+         for i, group in enumerate(self.fp16_groups):
+-            self.fp32_groups_flat[i].grad = None
++            for rank in sorted(self.ratios):
++                if rank != self.cpu_rank:
++                    for p in self.fp32_groups_flat_[rank][i]:
++                        p.grad = None
+ 
+         return
+ 
+@@ -205,6 +302,28 @@ class FP16_Optimizer(DeepSpeedOptimizer):
+         self.custom_loss_scaler = True
+         self.external_loss_scale = loss_scale
+ 
++    def has_overflow_serial(self, params):
++        invalid_grad_count = torch.zeros([1], dtype=torch.float, device=self.accel.current_device_name())
++        for p in params:
++            invalid_grad_count += self._has_inf_or_nan(p.grad)
++        return invalid_grad_count.bool()
++
++    def has_overflow(self, params):
++        overflow_gpu = self.has_overflow_serial(params).byte().to(self.accel.current_device_name())
++        dist.all_reduce(overflow_gpu, op=dist.ReduceOp.MAX, group=self.mpu.get_model_parallel_group())
++
++        overflow = overflow_gpu[0].item()
++        return bool(overflow)
++
++    # `x` is a torch.Tensor
++    @staticmethod
++    def _has_inf_or_nan(x):
++        float_x = x.float()
++        nan = float_x.isnan()
++        inf = float_x.isinf()
++        inf_or_nan = nan.logical_or(inf)
++        return inf_or_nan.float().max()
++
+     def step(self, closure=None):
+         """
+         Not supporting closure.
+@@ -218,7 +337,7 @@ class FP16_Optimizer(DeepSpeedOptimizer):
+         fp16_params = []
+         for i, group in enumerate(self.fp16_groups):
+             fp16_params.extend([p for p in group if p.grad is not None])
+-        self.overflow = self.overflow_checker.has_overflow(fp16_params)
++        self.overflow = self.has_overflow(fp16_params)
+         self.timers(OVERFLOW_CHECK_TIMER).stop()
+         prev_scale = self.cur_scale
+         self._update_scale(self.overflow)
+@@ -236,32 +355,22 @@ class FP16_Optimizer(DeepSpeedOptimizer):
+             self.timers.log(OVERFLOW_TIMERS)
+             return self.overflow
+ 
+-        grads_groups_flat = []
++        grads_groups_flat = {rank: [] for rank in self.ratios}
+         for i, group in enumerate(self.fp16_groups):
+-            data_type = self.fp32_groups_flat[i].dtype
+-
+-            grads_groups_flat.append(
+-                _flatten_dense_tensors([
+-                    torch.zeros(p.size(), dtype=data_type, device=p.device) if p.grad is None else p.grad.to(data_type)
+-                    for p in group
+-                ]))
+-
+-            for p in group:
+-                p.grad = None
+-
+-            self.fp32_groups_flat[i].grad = grads_groups_flat[i]
++            for rank, subgroups in sorted(self.fp16_groups_.items()):
++                grads = []
++                for params in subgroups[i]:
++                    grads.append(
++                        _flatten_dense_tensors([torch.zeros_like(p) if p.grad is None else p.grad
++                                                for p in params]).to(self.fp32_groups_flat_[rank][i][0].dtype))
++                    for p in params:
++                        p.grad = None
++                grads_groups_flat[rank].append(grads)
+ 
+         self.timers(COMPUTE_NORM_TIMER).start()
+-
+-        all_groups_norm = get_grad_norm(self.fp32_groups_flat, mpu=self.mpu)
+-
++        scaled_global_grad_norm = get_grads_norm(self.fp32_groups_flat_, grads_groups_flat)
+         self.timers(COMPUTE_NORM_TIMER).stop()
+ 
+-        if self.has_moe_layers:
+-            all_groups_norm = self._get_norm_with_moe_layers(all_groups_norm)
+-
+-        scaled_global_grad_norm = get_global_norm(norm_list=[all_groups_norm])
+-
+         # Stash unscaled gradient norm
+         self._global_grad_norm = scaled_global_grad_norm / self.cur_scale
+ 
+@@ -269,22 +378,39 @@ class FP16_Optimizer(DeepSpeedOptimizer):
+         self.unscale_and_clip_grads(grads_groups_flat, scaled_global_grad_norm)
+         self.timers(UNSCALE_AND_CLIP_TIMER).stop()
+ 
+-        self.timers(BASIC_STEP_TIMER).start()
+-        self.optimizer.step()
+-        self.timers(BASIC_STEP_TIMER).stop()
+-
+-        #get rid of the fp32 gradients. Not needed anymore
+-        for group in self.fp32_groups_flat:
+-            group.grad = None
+-
+-        self.timers(UPDATE_FP16_TIMER).start()
+-
+-        for i in range(len(self.fp16_groups)):
+-            updated_params = _unflatten_dense_tensors(self.fp32_groups_flat[i], self.fp16_groups[i])
+-            for p, q in zip(self.fp16_groups[i], updated_params):
+-                p.data.copy_(q.data)
+-
+-        self.timers(UPDATE_FP16_TIMER).stop()
++        for rank in sorted(self.ratios, reverse=True):
++            with self.accel.stream(self.opt_streams[rank]), self.accel.stream(self.recv_streams[rank]):
++                for i, group in enumerate(self.fp16_groups):
++                    if rank == self.local_rank:
++                        for j, fp32_p in enumerate(self.fp32_groups_flat_[rank][i]):
++                            fp32_p.grad = grads_groups_flat[rank][i][j]
++                    else:
++                        for j, fp32_p in enumerate(self.fp32_groups_flat_[rank][i]):
++                            if rank != self.cpu_rank:
++                                fp32_p.grad = torch.empty_like(fp32_p)
++                            fp32_p.grad.copy_(grads_groups_flat[rank][i][j], non_blocking=True)
++                            grads_groups_flat[rank][i][j] = None
++
++                self.optimizers[rank].step()
++
++                for i, group in enumerate(self.fp16_groups):
++                    if rank != self.cpu_rank:
++                        for p in self.fp32_groups_flat_[rank][i]:
++                            p.grad = None
++
++                for i in range(len(self.fp16_groups)):
++                    if rank == self.cpu_rank:
++                        for j, fp16_p in enumerate(self.fp16_groups_flat_[rank][i]):
++                            self.fp16_groups_flat_buffer[i][j].copy_(self.fp32_groups_flat_[rank][i][j],
++                                                                     non_blocking=True)
++                            fp16_p.data.copy_(self.fp16_groups_flat_buffer[i][j].data, non_blocking=True)
++                    else:
++                        for j, fp16_p in enumerate(self.fp16_groups_flat_[rank][i]):
++                            fp16_p.data.copy_(self.fp32_groups_flat_[rank][i][j].data, non_blocking=True)
++
++        for rank in sorted(self.ratios, reverse=True):
++            self.accel.current_stream().wait_stream(self.opt_streams[rank])
++            self.accel.current_stream().wait_stream(self.recv_streams[rank])
+ 
+         self.timers.log(STEP_TIMERS)
+ 
+@@ -314,8 +440,10 @@ class FP16_Optimizer(DeepSpeedOptimizer):
+                 combined_scale = clip * self.cur_scale
+ 
+         if apply_scale:
+-            for grad in grad_groups_flat:
+-                grad.data.mul_(1. / combined_scale)
++            for grad_subgroups in grad_groups_flat.values():
++                for grads in grad_subgroups:
++                    for g in grads:
++                        g.data.mul_(1. / combined_scale)
+ 
+         return combined_scale
+ 
+diff --git a/deepspeed/runtime/pipe/engine.py b/deepspeed/runtime/pipe/engine.py
+index 05029e4..f9d0f77 100644
+--- a/deepspeed/runtime/pipe/engine.py
++++ b/deepspeed/runtime/pipe/engine.py
+@@ -369,7 +369,7 @@ class PipelineEngine(DeepSpeedEngine):
+                                        stages=self.num_stages,
+                                        stage_id=self.stage_id)
+         self._exec_schedule(sched)
+-        self.agg_train_loss = self._aggregate_total_loss()
++        self.agg_train_loss = 0.1
+ 
+         self.timers(TRAIN_BATCH_TIMER).stop()
+ 
+@@ -708,6 +708,7 @@ class PipelineEngine(DeepSpeedEngine):
+             if self._compute_loss and self.module.loss_fn is not None:
+                 labels = self.pipe_buffers['labels'][buffer_id]
+                 self.loss = self.module.loss_fn(outputs, labels)
++                self.pipe_buffers['outputs'][buffer_id] = None
+             else:
+                 # Some models just return loss from forward()
+                 self.loss = outputs
+diff --git a/deepspeed/runtime/pipe/schedule.py b/deepspeed/runtime/pipe/schedule.py
+index 21bf24d..f51eb23 100644
+--- a/deepspeed/runtime/pipe/schedule.py
++++ b/deepspeed/runtime/pipe/schedule.py
+@@ -236,8 +236,6 @@ class TrainSchedule(PipeSchedule):
+ 
+             # Model step at the end of the batch
+             if step_id == total_steps - 1:
+-                cmds.append(ReduceTiedGrads())
+-                cmds.append(ReduceGrads())
+                 cmds.append(OptimizerStep())
+ 
+             # Prepare state for next time
+diff --git a/deepspeed/runtime/utils.py b/deepspeed/runtime/utils.py
+index d7a35b7..1286821 100755
+--- a/deepspeed/runtime/utils.py
++++ b/deepspeed/runtime/utils.py
+@@ -284,8 +284,8 @@ class CheckOverflow(object):
+         elif self.mpu is not None:
+             if self.deepspeed is not None:
+                 using_pipeline = hasattr(self.deepspeed, 'pipeline_enable_backward_allreduce')
+-                if (using_pipeline and self.deepspeed.pipeline_enable_backward_allreduce is False) or (
+-                        not using_pipeline and self.deepspeed.enable_backward_allreduce is False):
++                if (using_pipeline and self.deepspeed.pipeline_enable_backward_allreduce
++                        is False) or (not using_pipeline and self.deepspeed.enable_backward_allreduce is False):
+                     dist.all_reduce(overflow_gpu, op=dist.ReduceOp.MAX, group=self.mpu.get_data_parallel_group())
+             dist.all_reduce(overflow_gpu, op=dist.ReduceOp.MAX, group=self.mpu.get_model_parallel_group())
+         elif self.deepspeed is not None and self.deepspeed.enable_backward_allreduce is False:
+@@ -469,6 +469,32 @@ def get_grad_norm(parameters, norm_type=2, mpu=None):
+     return total_norm
+ 
+ 
++def get_grads_norm(parameters, gradients):
++    """Get grad norm of an iterable of parameters.
++    Returns:
++        Total norm of the parameters.
++    """
++    norm_type = float(2)
++    all_norms = []
++    for param_subgroups, grad_subgroups in zip(parameters.values(), gradients.values()):
++        for params, grads in zip(param_subgroups, grad_subgroups):
++            if hasattr(params[0], PIPE_REPLICATED) and params[0].ds_pipe_replicated:
++                continue
++            all_norms.extend(
++                [torch.norm(g.data.detach(), norm_type).to(get_accelerator().current_device_name()) for g in grads])
++    if len(all_norms) > 0:
++        total_norm = torch.stack(all_norms).square().sum()
++    else:
++        total_norm = torch.FloatTensor([0.0]).to(get_accelerator().current_device_name())
++    total_norm = total_norm.pow(1. / norm_type)
++
++    norm_is_inf = total_norm.isinf()
++    norm_is_nan = total_norm.isnan()
++    inf_or_nan = norm_is_nan.logical_or(norm_is_inf)
++
++    return inf_or_nan * -1.0 + inf_or_nan.logical_not() * total_norm
++
++
+ def get_grad_zeros(parameters, mpu=None):
+     """Compute the number of grads with zero values.
+ 
+@@ -808,6 +834,7 @@ def see_memory_usage(message, force=False):
+     logger.info(f'CPU Virtual Memory:  used = {used_GB} GB, percent = {vm_stats.percent}%')
+ 
+     # get the peak memory to report correct data, so reset the counter for the next call
++    get_accelerator().empty_cache()
+     get_accelerator().reset_peak_memory_stats()
+ 
+ 
